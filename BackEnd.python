@@ -1,0 +1,532 @@
+#! /usr/bin/env python
+# coding=utf-8
+__author__ = 'Huangyi'
+from bottle import *
+import hashlib
+import xml.etree.ElementTree as ET
+import urllib2,urllib,time
+import gzip
+import StringIO
+from sgmllib import SGMLParser
+import json
+
+#搭建python服务器
+
+import sys
+from socket import *
+#serverHost = 'localhost'
+serverHost = '42.91.187.183'
+serverPort = 90
+
+sockobj = socket(AF_INET, SOCK_STREAM,0)
+#连结至服务器及端口
+sockobj.connect((serverHost, serverPort))
+
+"""
+Log:
+本地调试问题：
+微信没有提供本地调试功能，给用户造成不小的麻烦。
+打开Bottle的Debug功能，在本地运行自己的代码（启动Server），使用Chrome或Firefox上的Advanced Rest Client插件来模拟微信服务器向自己的应用发送请求，
+这样就可以看到详细的报错信息，方便开发者定位修复问题，其相当于，自己的应用是SAE，而Advanced Rest Client模拟的是新微信客户端和微信服务器。
+也有同学自己写脚本，模拟微信服务器发送数据，这也是同样的道理。
+
+其他问题：
+1.从豆瓣拿到的海报图片都是竖向的，而微信中显示的是横向的，所以在微信看图片就被裁了一节，不过还好能看，
+  如何能完整显示海报图片，有待进一步research;
+2.现在的通过电影名称返回的结果，实际上是拿的豆瓣返回的第一条数据，这样就有可能不准确，如何精确匹配用户的
+  查询条件，也还需要进一步研究。s
+
+
+Update Log:
+#05-16完成快递查询API添加，还需要遍历输出,遍历输出本地无问题，但是SAE上无法遍历
+
+
+#05-29完成有道查询API添加
+
+#06-10完成电影查询，单词查询的逻辑判断和BBS十大抓取
+
+"""
+###########################################################################################################################################
+
+@get("/")
+def checkSignature():
+    """
+    这里是用来做接口验证的，从微信Server请求的URL中拿到“signature”,“timestamp”,"nonce"和“echostr”，
+    然后再将token, timestamp, nonce三个排序并进行Sha1计算，并将计算结果和拿到的signature进行比较，
+    如果相等，就说明验证通过。
+    话说微信的这个验证做的很渣，因为只要把echostr返回去，就能通过验证，这也就造成我看到一个Blog中，
+    验证那儿只返回了一个echostr，而纳闷了半天。
+    附微信Server请求的Url示例：http://yoursaeappid.sinaapp.com/?signature=730e3111ed7303fef52513c8733b431a0f933c7c
+    &echostr=5853059253416844429&timestamp=1362713741&nonce=1362771581
+    """
+    token = "GotoAny"  # 在微信公众平台上设置的TOKEN
+    signature = request.GET.get('signature', None)  # 
+    timestamp = request.GET.get('timestamp', None)
+    nonce = request.GET.get('nonce', None)
+    echostr = request.GET.get('echostr', None)
+    tmpList = [token, timestamp, nonce]
+    tmpList.sort()
+    tmpstr = "%s%s%s" % tuple(tmpList)
+    hashstr = hashlib.sha1(tmpstr).hexdigest()
+    if hashstr == signature:
+        return echostr
+    else:
+        return None
+
+
+def parse_msg():
+    """
+    这里是用来解析微信Server Post过来的XML数据的，取出各字段对应的值，以备后面的代码调用，也可用lxml等模块。
+    """
+    recvmsg = request.body.read()  # 严重卡壳的地方，最后还是在Stack OverFlow上找到了答案
+    root = ET.fromstring(recvmsg)
+    msg = {}
+    for child in root:
+        msg[child.tag] = child.text
+    return msg
+
+
+###############################################################################################################################
+
+def query_movie_info():
+    """
+    这里使用豆瓣的电影search API，通过关键字查询电影信息，这里的关键点是，一是关键字取XML中的Content值，
+    二是如果Content中存在汉字，就需要先转码，才能进行请求
+    """
+    movieurlbase = "http://api.douban.com/v2/movie/search"
+    #DOUBAN_APIKEY = "0ec7076653f7fffb2c551632fbe7fff1"  # 这里需要填写你自己在豆瓣上申请的应用的APIKEY
+    DOUBAN_APIKEY = "08ba8e9d001c3a0f1a2fabd70054ae2d"  #我的APIKey
+    movieinfo = parse_msg()
+    data=movieinfo["Content"].split(' ')
+    info=data[1]
+    
+    searchkeys = urllib2.quote(info.encode("utf-8"))  # 如果Content中存在汉字，就需要先转码，才能进行请求
+    url = '%s?q=%s&apikey=%s' % (movieurlbase, searchkeys, DOUBAN_APIKEY)
+    # return "<p>{'url': %s}</p>" % url
+    # url = '%s%s?apikey=%s' % (movieurlbase, id["Content"], DOUBAN_APIKEY)
+    # resp = requests.get(url=url, headers=header)
+    resp = urllib2.urlopen(url)
+    movie = json.loads(resp.read())
+    # return "<p>{'movie': %s}</p>" % movie
+    # info = movie["subjects"][0]["title"] + movie["subjects"][0]["alt"]
+    # info = movie['title'] + ': ' + ''.join(movie['summary'])
+    return movie
+    # return info
+
+
+def query_movie_details():
+    """
+    这里使用豆瓣的电影subject API，通过在query_movie_info()中拿到的电影ID，来获取电影的summary。
+    """
+    movieurlbase = "http://api.douban.com/v2/movie/subject/"
+    #DOUBAN_APIKEY = "0ec7076653f7fffb2c551632fbe7fff1"  # 这里需要填写你自己在豆瓣上申请的应用的APIKEY
+    DOUBAN_APIKEY = "08ba8e9d001c3a0f1a2fabd70054ae2d" 
+    id = query_movie_info()
+    url = '%s%s?apikey=%s' % (movieurlbase, id["subjects"][0]["id"], DOUBAN_APIKEY)
+    resp = urllib2.urlopen(url)
+    description = json.loads(resp.read())
+    description = ''.join(description['summary'])
+    return description
+
+
+
+###############################################################################################################################
+"""
+加入天气的运用
+"""
+
+url_lz = 'http://m.weather.com.cn/data/101160101.html'
+urls = [url_lz]
+def weather():
+    weather = u""
+    for url in urls:
+        weather = weather + get_weatherinfo(url)
+    return weather
+    
+
+def get_weatherinfo(url):
+    try:
+        rawinfo = urllib2.urlopen(url).read()
+        weatherinfo = json.loads(rawinfo)
+        weatherinfo = weatherinfo["weatherinfo"]
+        content = u"%s, %s, %s\n" % (weatherinfo["city"], weatherinfo["date_y"], weatherinfo["week"]) + u"今天：%s,%s\n" % (weatherinfo["temp1"], weatherinfo["weather1"]) + u"明天：%s,%s\n" % (weatherinfo["temp2"], weatherinfo["weather2"]) + u"后天：%s,%s\n" % (weatherinfo["temp3"], weatherinfo["weather3"])
+        return content
+    except:
+        return u"暂时无法获取天气信息，请稍后再试"
+
+
+
+url_aqi = 'http://pm25.in/api/querys/aqi_details.json?city=lanzhou&token=BmG218dEA4QzGbVv1tEZ'
+def get_airquality():
+    AQI = {"aqi":None, "area":None, "pm2_5":None, "pm10":None, "quality":None, "time_point":None}
+    try:
+        rawinfo = urllib2.urlopen(url_aqi).read()
+        airinfo = json.loads(rawinfo)
+        airinfo = airinfo[-1]
+        for key in list(airinfo.viewkeys()):
+            AQI[key] = airinfo[key]
+    except:
+        return u"暂时无法获取空气质量详情，请稍后再"
+    
+    content = u"%s空气质量指数：%s\nPM2.5: %s \t PM10: %s\n空气质量类别为：%s\n 数据来源网络 更新时间 %s" % (AQI["area"], AQI["aqi"], AQI["pm2_5"], AQI["pm10"], AQI["quality"], AQI["time_point"])
+    return content
+    
+    
+    
+###############################################################################################################################
+"""
+加入快递查询的应用http://api.ickd.cn/?com=[]&nu=[]&id=[]
+"""
+url_kd='http://api.ickd.cn/'
+url_test='http://api.ickd.cn/?com=yunda&nu=1900374825230&id=AE82F515EA311E1F9D0F3AF6889BAEB0&encode=utf8'
+apikey_kd="AE82F515EA311E1F9D0F3AF6889BAEB0"
+def get_package():
+    KD = {"time":None, "context":None}
+    packageinfo = parse_msg()
+    searchkeys = urllib2.quote(packageinfo["Content"].encode("utf-8"))  #转码后用split函数再data[0]出现问题
+    data=packageinfo["Content"].split(' ')
+    #data=searchkeys.split(' ')  
+    searchcom=data[0]
+    searchnum=data[1]
+    url = '%s?com=%s&nu=%s&id=%s&encode=utf8' % (url_kd,searchcom,searchnum,apikey_kd)
+    try:
+       rawinfo = urllib2.urlopen(url).read()
+       packageinfo = json.loads(rawinfo)   #这条语句抛出异常，是编码格式错误，需要加上encode=utf8
+       rar = packageinfo["data"]   #这里需要再重新写一下。显示格式有问题 .rar是一个含有字典的列表。问题在于获取列表中的字典，显示有错误
+    
+    
+       rar=rar[-1]
+       for key in list(rar.viewkeys()):
+             KD[key] = rar[key]
+
+    except:
+       return u"暂时无法获取快递详情，请检查输入单号是否正确或稍后再试"
+    content=u"时间：%s \n状态: %s \n" % (KD['time'],KD['context'])
+    return content
+
+
+   
+###############################################################################################################################
+"""
+加入有道字典的API
+"""
+url_youdao='http://fanyi.youdao.com/openapi.do?keyfrom=zhichengtech&key=2079447084&type=data&doctype=json&version=1.1&q='
+def get_dictionary():
+    packageinfo = parse_msg()
+    data=packageinfo["Content"].split(' ')
+    info=data[1]
+    searchkeys = urllib2.quote(info.encode("utf-8"))
+    url='%s%s'%(url_youdao,searchkeys)
+    try:
+       rawinfo = urllib2.urlopen(url).read()
+       packageinfo = json.loads(rawinfo)   
+       rar = packageinfo["basic"]["explains"]
+       rar=''.join(rar)
+   
+    except:
+       return u"暂时无法获取翻译查询详情，请检查是否拼写正确或稍后再试"
+    
+    content=u"查询结果:%s" % rar
+    return content
+
+
+
+###############################################################################################################################
+"""
+加入BBS论坛的API
+"""
+
+#06-20 update log:可以抓取到“最新话题”“今日十大”“失物招领”“热门交易”“重要通知”
+
+'''class GetIdList(SGMLParser):
+    def reset(self):
+        self.IDlist = []
+        self.flag = False
+        self.getdata = False
+        self.verbatim = 0
+        SGMLParser.reset(self)
+        
+    def start_div(self, attrs):
+        if self.flag == True:
+            self.verbatim +=1 #进入子层div了，层数加1
+            return
+        for k,v in attrs:#遍历div的所有属性以及其值
+            if k == 'class' and v == 'TabbedPanelsContentGroup':#确定进入了<div class='entry-content'>
+                self.flag = True
+                return
+
+    def end_div(self):#遇到</div>
+        if self.verbatim == 0:
+            self.flag = False
+        if self.flag == True:#退出子层div了，层数减1
+            self.verbatim -=1
+
+    def start_li(self, attrs):
+        if self.flag == False:
+            return
+        self.getdata = True
+        
+    def end_li(self):#遇到</p>
+        if self.getdata:
+            self.getdata = False
+
+    def handle_data(self, text):#处理文本
+        if self.getdata:
+            self.IDlist.append(text)
+            
+    def printID(self):
+        content = ''
+        for i in self.IDlist:
+            content = content +'\n'+ i
+        return content
+
+
+'''
+
+
+###################################################################################################################################
+    
+@post("/")
+def response_msg():
+    """
+    这里是响应微信Server的请求，并返回数据的主函数，判断Content内容，如果是“Hello2BizUser”，就
+    表明是一个新注册用户，调用纯文本格式返回，如果是其他的内容就组织数据以图文格式返回。
+
+    基本思路：
+    # 拿到Post过来的数据
+    # 分析数据（拿到FromUserName、ToUserName、CreateTime、MsgType和content）
+    # 构造回复信息（将你组织好的content返回给用户）
+    """
+    # 拿到并解析数据
+    msg = parse_msg()
+    # 设置返回数据模板
+    # 纯文本格式
+    textTpl = """<xml>
+             <ToUserName><![CDATA[%s]]></ToUserName>
+             <FromUserName><![CDATA[%s]]></FromUserName>
+             <CreateTime>%s</CreateTime>
+             <MsgType><![CDATA[text]]></MsgType>
+             <Content><![CDATA[%s]]></Content>
+             <FuncFlag>0</FuncFlag>
+             </xml>"""
+    # 图文格式
+    pictextTpl = """<xml>
+                <ToUserName><![CDATA[%s]]></ToUserName>
+                <FromUserName><![CDATA[%s]]></FromUserName>
+                <CreateTime>%s</CreateTime>
+                <MsgType><![CDATA[news]]></MsgType>
+                <ArticleCount>1</ArticleCount>
+                <Articles>
+                <item>
+                <Title><![CDATA[%s]]></Title>
+                <Description><![CDATA[%s]]></Description>
+                <PicUrl><![CDATA[%s]]></PicUrl>
+                <Url><![CDATA[%s]]></Url>
+                </item>
+                </Articles>
+                <FuncFlag>1</FuncFlag>
+                </xml> """
+    # 判断Content内容，如果等于"Hello2BizUser"，表明是一个新关注用户，如果不是，就返回电影标题，电影简介
+    # 和电影海报组成的图文信息
+    
+    
+   ############################################## 进行分发  
+    
+    sockobj.send(msg["Content"]) #这一步显示正确
+    #igdata=sockobj.recv(2048) #代码会阻塞停在这里
+    
+    #ockobj.close()
+    
+    
+ 
+   
+    #################################################
+    
+    if msg["MsgType"] == "event":############初始对用户进行提醒
+        echostr = textTpl % (
+            msg['FromUserName'], msg['ToUserName'], str(int(time.time())),
+            u'''
+            你好。欢迎关注兰大校园生活助手。
+            1.输入 bus，查询 校车时刻表
+            2.输入 weather，查询 天气预报
+            3.输入 air，查询 天气质量
+            4.输入 dic+空格+单词，进行 单词查询
+            5.输入 film+空格+电影名，进行电影简介查询
+            6.输入 快递公司代码+空格+运单号，进行快递查询.(ps：快递公司代码yuantong-圆通，yunda-韵达)
+            ''')
+        return echostr
+    elif msg["Content"] == "bus":##############查询校车时刻表
+        echostr = textTpl % (
+            msg['FromUserName'], msg['ToUserName'], str(int(time.time())),
+            u"兰大校车时刻表：本部 发往 榆中 7:10 9:10 13:10 15:10 16:40 19:00 	榆中 发往 本部 8:10 10:20 12:20 13:00 16:20 17:15 17:45 18:05 21:10")
+        return echostr
+    elif msg["Content"] == "huangyi":############彩蛋程序
+        echostr = textTpl % (
+            msg['FromUserName'], msg['ToUserName'], str(int(time.time())),
+            u'''      
+  这些年-致青春
+                 黄逸
+
+这些年的浪漫  
+好多都与你相关
+有时你执一把长柄黑伞
+可我视而不见走出这雨天
+
+你也在舞台宛若芙蕖
+我也就像湖水一样注视湖岸
+ 
+这些年的孤独
+好多都与你无关
+有时我拿一本无名诗集
+可你写的每句诗我都觉得嵌在中央
+ 
+我也在人群侧身伸手
+你也就像星空一般绘出黑暗
+
+ ''')
+        return echostr
+ 
+    elif msg["Content"] == "weather":############查询天气预报
+        data=weather()
+        echostr = textTpl % (
+            msg['FromUserName'], msg['ToUserName'], str(int(time.time())),
+            data)
+        return echostr
+
+    elif msg["Content"] == "air":############查询天气质量
+        data=get_airquality()
+        echostr = textTpl % (
+            msg['FromUserName'], msg['ToUserName'], str(int(time.time())),
+            data)
+        return echostr
+    
+    
+    elif msg["Content"] == "bbs":############查询西北望BBS
+        
+         
+        
+        
+        class GetIdList(SGMLParser):
+            def reset(self):
+                self.IDlist = []
+                self.flag = False
+                self.getdata = False
+                self.verbatim = 0
+                SGMLParser.reset(self)
+        
+            def start_div(self, attrs):
+                if self.flag == True:
+                    self.verbatim +=1 #进入子层div了，层数加1
+                    return
+                for k,v in attrs:#遍历div的所有属性以及其值
+                    if k == 'class' and v == 'TabbedPanelsContentGroup':#确定进入了<div class='entry-content'>
+                        self.flag = True
+                        return
+
+            def end_div(self):#遇到</div>
+                if self.verbatim == 0:
+                    self.flag = False
+                if self.flag == True:#退出子层div了，层数减1
+                    self.verbatim -=1
+
+            def start_li(self, attrs):
+                if self.flag == False:
+                    return
+                self.getdata = True
+        
+            def end_li(self):#遇到</p>
+                if self.getdata:
+                    self.getdata = False
+
+            def handle_data(self, text):#处理文本
+                if self.getdata:
+                    self.IDlist.append(text)
+            
+            def printID(self):
+                content = ''
+                for i in self.IDlist:
+                    content = content +'\n'+ i
+                return content
+            
+    
+        # 页面url
+        url = "http://daohang.xbwbbs.com/"
+        req = urllib2.Request(url)#通过网络获取网页
+        response = urllib2.urlopen(req)
+        page = response.read()
+        if not isinstance(page, unicode):
+            page= page.decode('utf-8', 'ignore')
+            page=page.encode('utf-8')
+       
+        
+        lister = GetIdList()
+        lister.feed(page)
+        data=lister.printID()
+   
+        echostr = textTpl % (
+            msg['FromUserName'], msg['ToUserName'], str(int(time.time())),
+            data)
+        return echostr
+        
+        
+    else:
+        
+     try:
+        data=msg["Content"].split(' ')
+        key=data[0]
+        info=data[1]
+        
+        if key=="dic":           ##############查询单词翻译
+          content=get_dictionary()
+          echostr = textTpl % (
+          msg['FromUserName'], msg['ToUserName'], str(int(time.time())),
+            content)
+          return echostr
+        
+        
+        
+       
+        elif key=="film":        ###############查询电影简讯
+            Content = query_movie_info()
+            description = query_movie_details()
+            echostr = pictextTpl % (msg['FromUserName'], msg['ToUserName'], str(int(time.time())),
+                                Content["subjects"][0]["title"], description,
+                                Content["subjects"][0]["images"]["large"], Content["subjects"][0]["alt"])
+            return echostr
+        
+          
+        else:                    ###############default进行快递查询，测试单号 圆通 6329685777
+            data=get_package()
+            echostr = textTpl % (
+                msg['FromUserName'], msg['ToUserName'], str(int(time.time())),
+                data)
+            return echostr
+ 
+     except:
+        data='''
+        1.输入 bus，查询 校车时刻表
+        2.输入 weather，查询 天气预报
+        3.输入 air，查询 天气质量
+        4.输入 dic+空格+单词，进行 单词查询
+        5.输入 film+空格+电影名，进行电影简介查询
+        6.输入 快递公司代码+空格+运单号，进行快递查询.(ps：快递公司代码yuantong-圆通，yunda-韵达)
+        '''
+    
+    echostr = textTpl % (
+                msg['FromUserName'], msg['ToUserName'], str(int(time.time())),
+                data)
+    return echostr
+
+        
+
+if __name__ == "__main__":
+    # Interactive mode
+    debug(True)
+    run(host='127.0.0.1', port=8888, reloader=True)
+else:
+    # Mod WSGI launch
+    import sae
+    debug(True)
+    os.chdir(os.path.dirname(__file__))
+    app = default_app()
+    application = sae.create_wsgi_app(app)
